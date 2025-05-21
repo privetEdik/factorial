@@ -29,7 +29,7 @@ public class FactorialWorker implements Runnable {
             while (true) {
                 InputLine input = inputQueue.poll(AppConfig.POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 if (input == null) {
-                    if (stopFlag.get()) return;
+                    if (stopFlag.get() && inputQueue.isEmpty()) return;
                     continue;
                 }
                 //хочу отключать лимитер для быстрого тестирования

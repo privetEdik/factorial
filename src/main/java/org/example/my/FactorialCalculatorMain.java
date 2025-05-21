@@ -17,43 +17,99 @@ public class FactorialCalculatorMain {
         //  получение данных из консоли: пул потоков, возможность выключать работу лимитера(не по тз)
         int poolSize = findPoolSize(args);
         boolean limiterEnabled = findLimiterFlag(args);
-        //создание очереди на чтение, очереди на запись, флага остановки
+        // создание очереди на чтение, очереди на запись, флага остановки
         BlockingQueue<InputLine> inputQueue = new LinkedBlockingQueue<>();
         BlockingQueue<OutLine> outputQueue = new LinkedBlockingQueue<>();
-        AtomicBoolean stopFlag = new AtomicBoolean(false);
+        // создание флагов остановки
+        AtomicBoolean stopWorkersFlag = new AtomicBoolean(false);
+        AtomicBoolean stopWriterFlag = new AtomicBoolean(false);
         // создание потоков
         ExecutorService reader = Executors.newSingleThreadExecutor();
-        ExecutorService writer = Executors.newSingleThreadExecutor();
         ExecutorService workers = Executors.newFixedThreadPool(poolSize);
+        ExecutorService writer = Executors.newSingleThreadExecutor();
         // создание ограничителей: лимит разрешений
-        Semaphore tokenLimiter = new Semaphore(AppConfig.INITIAL_SEMAPHORE_PERMIT);
-        //                       : частота выдачи
-        ScheduledExecutorService limiter = Executors.newScheduledThreadPool(AppConfig.CORE_POOL_SIZE_SCHEDULER);
-        limiter.scheduleAtFixedRate(
-                () -> tokenLimiter.release(AppConfig.SEMAPHORE_PERMITS),
+        Semaphore rateLimiter = new Semaphore(AppConfig.INITIAL_SEMAPHORE_PERMIT);
+        // создание ограничителей: наполнитель разрешений
+        ScheduledExecutorService tokenIntervalFiller = Executors.newSingleThreadScheduledExecutor();
+        // конфигурация наполнителя
+        tokenIntervalFiller.scheduleAtFixedRate(
+                () -> rateLimiter.release(AppConfig.SEMAPHORE_PERMITS),
                 AppConfig.SEMAPHORE_INITIAL_DELAY,
                 AppConfig.SEMAPHORE_INTERVAL_MILLIS,
-                TimeUnit.MILLISECONDS);
-        // старт выполнения
-        reader.submit(new ProducerService(inputQueue));
-        FactorialManager manager = new FactorialManager();
-        manager.submitWorkers(
-                inputQueue,
-                outputQueue,
-                tokenLimiter,
-                workers,
-                poolSize,
-                limiterEnabled,
-                stopFlag);
-        writer.submit(new ConsumerService(outputQueue, stopFlag));
-        //завершение
-        shutdownAndAwait(reader, "reader");
-        stopFlag.set(true);
-        shutdownAndAwait(workers, "workers");
-        shutdownAndAwait(writer, "writer");
+                TimeUnit.MILLISECONDS
+        );
+        reader.execute(new ProducerService(inputQueue));
+        new FactorialManager().submitWorkers(
+                inputQueue, outputQueue, rateLimiter,
+                workers, poolSize, limiterEnabled, stopWorkersFlag
+        );
+        writer.execute(new ConsumerService(outputQueue, stopWriterFlag));
+        // Последовательное завершение
+        shutdownWithCompletableFuture(reader, workers, writer, tokenIntervalFiller,
+                inputQueue, outputQueue,
+                stopWorkersFlag, stopWriterFlag);
 
-        limiter.shutdownNow();
-        log.info("All operations completed. Application exits cleanly.");
+    }
+
+    private static void shutdownWithCompletableFuture(
+            ExecutorService reader,
+            ExecutorService workers,
+            ExecutorService writer,
+            ScheduledExecutorService tokenIntervalFiller,
+            BlockingQueue<InputLine> inputQueue,
+            BlockingQueue<OutLine> outputQueue,
+            AtomicBoolean stopWorkersFlag,
+            AtomicBoolean stopWriterFlag
+    ) {
+        CompletableFuture<?> shutdownSequence = CompletableFuture
+                .runAsync(() -> shutdownExecutor("Reader", reader))
+                .thenRunAsync(() -> awaitQueueDrain("Input Queue", inputQueue))
+                .thenRunAsync(() -> {
+                    stopWorkersFlag.set(true);
+                    shutdownExecutor("Workers", workers);
+                })
+                .thenRunAsync(() -> shutdownExecutor("Token Interval Filler", tokenIntervalFiller))
+                .thenRunAsync(() -> awaitQueueDrain("Output Queue", outputQueue))
+                .thenRunAsync(() -> {
+                    stopWriterFlag.set(true);
+                    shutdownExecutor("Writer", writer);
+                });
+
+        try {
+            shutdownSequence.get(AppConfig.SHUTDOWN_TIMEOUT_SEC, TimeUnit.SECONDS); // Таймаут на завершение
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Shutdown interrupted: ", e);
+        } catch (ExecutionException | TimeoutException e) {
+            log.error(e.getMessage());
+        }
+    }
+
+    private static void shutdownExecutor(String name, ExecutorService service) {
+        log.info("Shutting down {}...", name);
+        service.shutdown();
+        try {
+            if (!service.awaitTermination(AppConfig.EXECUTOR_SHUTDOWN_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                log.warn("Forcing {} shutdown", name);
+                service.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            service.shutdownNow();
+        }
+    }
+
+    private static void awaitQueueDrain(String queueName, BlockingQueue<?> queue) {
+
+        while (!queue.isEmpty()) {
+            try {
+                TimeUnit.MILLISECONDS.sleep(AppConfig.WAITING_TIME_FOR_FULL_QUEUE_MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        log.debug("{} drained", queueName);
 
     }
 
@@ -85,17 +141,4 @@ public class FactorialCalculatorMain {
             return true;
         }
     }
-
-    private static void shutdownAndAwait(ExecutorService service, String name) {
-        service.shutdown();
-        try {
-            while (!service.awaitTermination(AppConfig.AWAIT_TERMINATION, TimeUnit.SECONDS)) {
-                log.info("Waiting for {} to finish...", name);
-            }
-        } catch (InterruptedException e) {
-            log.warn("Interrupted while waiting for {} to finish", name);
-            Thread.currentThread().interrupt();
-        }
-    }
-
 }
